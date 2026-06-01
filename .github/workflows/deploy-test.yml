@@ -1,0 +1,226 @@
+name: Deploy Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Source ref/sha to deploy"
+        type: string
+        default: main
+  repository_dispatch:
+    types: [deploy-test]
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  BUN_JSC_forceRAMSize: "4294967296"
+  PUPPETEER_SKIP_DOWNLOAD: "true"
+  NODE_VERSION: "20"
+
+concurrency:
+  group: deploy-test-workflow
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    name: 🧭 Resolve inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    outputs:
+      ref: ${{ steps.r.outputs.ref }}
+    steps:
+      - id: r
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "ref=${{ github.event.client_payload.sha || 'main' }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ inputs.ref || 'main' }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  setup:
+    name: 📦 Setup & Build
+    runs-on: ubuntu-latest
+    needs: resolve
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.11"
+
+      - name: Cache bun global cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.bun/install/cache
+          key: bun-cache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/bun.lock') }}
+          restore-keys: bun-cache-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+        env:
+          NPM_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+
+      - name: Build CDK
+        run: bun run build
+
+      - name: Build Lambdas
+        run: |
+          (cd lambda/transcribe-processor && bun run build) &
+          (cd lambda/ai-analysis-processor && bun run build) &
+          (cd lambda/reconciliation-orchestrator && bun run build) &
+          (cd lambda/reconciliation-worker && bun run build) &
+          (cd lambda/contacts-analyzer && bun run build) &
+          wait
+
+      - name: CDK Synth
+        env:
+          SENTRY_RELEASE: ${{ github.sha }}
+        run: bunx cdk synth --context environment=test
+
+      - name: Upload CDK templates
+        uses: actions/upload-artifact@v7
+        with:
+          name: cdk-out
+          path: cdk.out/
+          retention-days: 7
+
+  deploy:
+    name: 🚀 Deploy (hotswap)
+    runs-on: ubuntu-latest
+    needs: [resolve, setup]
+    timeout-minutes: 30
+    environment: test
+    concurrency:
+      group: deploy-test
+      cancel-in-progress: false
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SOURCE_REPO }}
+          ref: ${{ needs.resolve.outputs.ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+
+      - name: Download CDK templates
+        uses: actions/download-artifact@v8
+        with:
+          name: cdk-out
+          path: cdk.out/
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.11"
+
+      - name: Cache bun global cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.bun/install/cache
+          key: bun-cache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/bun.lock') }}
+          restore-keys: bun-cache-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+        env:
+          NPM_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+
+      - name: Build CDK and Lambdas
+        run: |
+          bun run build
+          (cd lambda/transcribe-processor && bun run build) &
+          (cd lambda/ai-analysis-processor && bun run build) &
+          (cd lambda/reconciliation-orchestrator && bun run build) &
+          (cd lambda/reconciliation-worker && bun run build) &
+          (cd lambda/contacts-analyzer && bun run build) &
+          wait
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_ROLE_NAME }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: GitHubActions-Deploy-Test
+
+      - name: Verify AWS credentials
+        run: aws sts get-caller-identity --query Account --output text > /dev/null && echo "AWS credentials OK"
+
+      - name: Deploy to Test (hotswap)
+        env:
+          SENTRY_RELEASE: ${{ github.sha }}
+        run: |
+          bunx cdk deploy --all \
+            --app cdk.out \
+            --context environment=test \
+            --require-approval never \
+            --hotswap-fallback \
+            --outputs-file cdk-outputs.json \
+            --verbose
+
+      - name: Upload deployment outputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: cdk-outputs
+          path: cdk-outputs.json
+          retention-days: 30
+
+  smoke-test:
+    name: 🧪 Smoke Tests
+    runs-on: ubuntu-latest
+    needs: deploy
+    timeout-minutes: 10
+    environment: test
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_ROLE_NAME }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: GitHubActions-SmokeTest-Test
+
+      - name: Download deployment outputs
+        uses: actions/download-artifact@v8
+        with:
+          name: cdk-outputs
+
+      - name: Health Checks
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          LAMBDA_PREFIX: ${{ vars.LAMBDA_PREFIX }}
+        run: |
+          [ -f cdk-outputs.json ] || { echo "CDK outputs missing"; exit 1; }
+          for fn in transcribe-processor-ts ai-analysis-processor-ts reconciliation-orchestrator reconciliation-worker message-processor contacts-analyzer; do
+            FUNC="${LAMBDA_PREFIX}${fn}-${AWS_REGION}"
+            aws lambda get-function --function-name "$FUNC" --region "$AWS_REGION" &>/dev/null \
+              && echo "  ✅ $FUNC" \
+              || { echo "  ❌ $FUNC - MISSING"; exit 1; }
+          done
+          echo "All smoke tests passed!"
