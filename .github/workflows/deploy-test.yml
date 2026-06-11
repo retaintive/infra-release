@@ -173,13 +173,27 @@ jobs:
         env:
           SENTRY_RELEASE: ${{ github.sha }}
         run: |
-          bunx cdk deploy --all \
-            --app cdk.out \
-            --context environment=test \
-            --require-approval never \
-            --hotswap-fallback \
-            --outputs-file cdk-outputs.json \
-            --verbose
+          for attempt in 1 2 3; do
+            echo "CDK deploy attempt $attempt/3"
+            if bunx cdk deploy --all \
+              --app cdk.out \
+              --context environment=test \
+              --require-approval never \
+              --hotswap-fallback \
+              --outputs-file cdk-outputs.json \
+              --verbose; then
+              exit 0
+            fi
+
+            if [ "$attempt" = "3" ]; then
+              echo "::error::CDK deploy failed after 3 attempts"
+              exit 1
+            fi
+
+            sleep_seconds=$((attempt * 30))
+            echo "::warning::CDK deploy failed, retrying in ${sleep_seconds}s"
+            sleep "$sleep_seconds"
+          done
 
       - name: Upload deployment outputs
         uses: actions/upload-artifact@v7
